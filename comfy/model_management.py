@@ -5,6 +5,8 @@ from comfy.cli_args import args
 import torch
 import sys
 import platform
+if args.use_npu==True:
+    import torch_npu
 
 class VRAMState(Enum):
     DISABLED = 0    #No vram present: no need to move models to vram
@@ -71,6 +73,12 @@ def is_intel_xpu():
             return True
     return False
 
+def is_ascend_npu():
+    if args.use_npu and torch.npu.is_available():
+        return True
+    return False
+
+
 def get_torch_device():
     global directml_enabled
     global cpu_state
@@ -84,6 +92,8 @@ def get_torch_device():
     else:
         if is_intel_xpu():
             return torch.device("xpu", torch.xpu.current_device())
+        elif is_ascend_npu():
+            return torch.device("npu",torch.npu.current_device())
         else:
             return torch.device(torch.cuda.current_device())
 
@@ -104,6 +114,11 @@ def get_total_memory(dev=None, torch_total_too=False):
             mem_reserved = stats['reserved_bytes.all.current']
             mem_total_torch = mem_reserved
             mem_total = torch.xpu.get_device_properties(dev).total_memory
+        elif is_ascend_npu():
+            stats = torch.npu.memory_stats(dev)
+            mem_reserved = stats['reserved_bytes.all.current']
+            mem_total_torch = mem_reserved
+            mem_total = torch.npu.get_device_properties(dev).total_memory
         else:
             stats = torch.cuda.memory_stats(dev)
             mem_reserved = stats['reserved_bytes.all.current']
@@ -180,10 +195,14 @@ try:
     if is_intel_xpu():
         if args.use_split_cross_attention == False and args.use_quad_cross_attention == False:
             ENABLE_PYTORCH_ATTENTION = True
+    # TODO:
 except:
     pass
 
 if is_intel_xpu():
+    VAE_DTYPES = [torch.bfloat16] + VAE_DTYPES
+
+if is_ascend_npu():
     VAE_DTYPES = [torch.bfloat16] + VAE_DTYPES
 
 if args.cpu_vae:
@@ -243,6 +262,8 @@ def get_torch_device_name(device):
             return "{}".format(device.type)
     elif is_intel_xpu():
         return "{} {}".format(device, torch.xpu.get_device_name(device))
+    elif is_ascend_npu():
+        return "{} {}".format(device, torch.npu.get_device_name(device))
     else:
         return "CUDA {}: {}".format(device, torch.cuda.get_device_name(device))
 
@@ -666,6 +687,7 @@ def device_supports_non_blocking(device):
         return False #pytorch bug? mps doesn't support non blocking
     if is_intel_xpu():
         return False
+    # TODO: 
     if args.deterministic: #TODO: figure out why deterministic breaks non blocking from gpu to cpu (previews)
         return False
     if directml_enabled:
@@ -694,6 +716,8 @@ def cast_to_device(tensor, device, dtype, copy=False):
             device_supports_cast = True
         elif is_intel_xpu():
             device_supports_cast = True
+        elif is_ascend_npu():
+            device_supports_cast = True
 
     non_blocking = device_should_use_non_blocking(device)
 
@@ -713,6 +737,8 @@ def xformers_enabled():
     if cpu_state != CPUState.GPU:
         return False
     if is_intel_xpu():
+        return False
+    if is_ascend_npu():
         return False
     if directml_enabled:
         return False
@@ -737,6 +763,8 @@ def pytorch_attention_flash_attention():
         if is_nvidia(): #pytorch flash attention only works on Nvidia
             return True
         if is_intel_xpu():
+            return True
+        if is_ascend_npu():
             return True
     return False
 
@@ -771,6 +799,14 @@ def get_free_memory(dev=None, torch_free_too=False):
             mem_free_torch = mem_reserved - mem_active
             mem_free_xpu = torch.xpu.get_device_properties(dev).total_memory - mem_reserved
             mem_free_total = mem_free_xpu + mem_free_torch
+        elif is_ascend_npu():
+            stats = torch.npu.memory_stats(dev)
+            mem_active = stats['active_bytes.all.current']
+            mem_reserved = stats['reserved_bytes.all.current']
+            mem_free_torch = mem_reserved - mem_active
+            mem_free_xpu = torch.npu.get_device_properties(dev).total_memory - mem_reserved
+            mem_free_total = mem_free_xpu + mem_free_torch
+
         else:
             stats = torch.cuda.memory_stats(dev)
             mem_active = stats['active_bytes.all.current']
@@ -836,6 +872,9 @@ def should_use_fp16(device=None, model_params=0, prioritize_performance=True, ma
     if is_intel_xpu():
         return True
 
+    if is_ascend_npu():
+        return True
+
     if torch.version.hip:
         return True
 
@@ -891,6 +930,9 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
 
     if is_intel_xpu():
         return True
+    
+    if is_ascend_npu():
+        return True
 
     if device is None:
         device = torch.device("cuda")
@@ -914,6 +956,8 @@ def soft_empty_cache(force=False):
         torch.mps.empty_cache()
     elif is_intel_xpu():
         torch.xpu.empty_cache()
+    elif is_ascend_npu():
+        torch.npu.empty_cache()
     elif torch.cuda.is_available():
         if force or is_nvidia(): #This seems to make things worse on ROCm so I only do it for cuda
             torch.cuda.empty_cache()
